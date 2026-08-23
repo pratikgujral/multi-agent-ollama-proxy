@@ -1,0 +1,29 @@
+# SQLite Database
+*.db
+*.sqlite3
+
+# Log Files
+*.log
+*.log.*
+
+# Excel Reports
+*.xlsx
+*.xls
+!Ollama_Cluster_Report.xlsx 
+
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
