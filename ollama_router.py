@@ -21,6 +21,7 @@ SUBNETS = ["192.168.1.0/24"]
 DB_FILE = "ollama_cluster.db"
 SCAN_INTERVAL = 300  
 CONCURRENCY_LIMIT = 1000
+DISABLE_SCAN = False
 
 # Global event for manual scan triggering
 trigger_scan_event = asyncio.Event()
@@ -153,9 +154,13 @@ async def scan_network_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    task = asyncio.create_task(scan_network_loop())
-    yield
-    task.cancel()
+    if not DISABLE_SCAN:
+        task = asyncio.create_task(scan_network_loop())
+        yield
+        task.cancel()
+    else:
+        log.info("[*] Running in router-only mode. Background scanner is disabled.")
+        yield
 
 app = FastAPI(lifespan=lifespan)
 
@@ -225,12 +230,16 @@ if __name__ == "__main__":
         default=8000, 
         help="Port to run the API router on (default: 8000)"
     )
-    # --- NEW ARGUMENT ---
     parser.add_argument(
         "--max-concurrent-pings", 
         type=int, 
         default=500, 
         help="Maximum number of simultaneous network sockets to open. Lower this to avoid triggering security alerts (default: 500)"
+    )
+    parser.add_argument(
+        "--no-scan", 
+        action="store_true", 
+        help="Run the router only, relying on the existing database without background scanning."
     )
     # --------------------
     
