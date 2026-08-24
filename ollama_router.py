@@ -4,6 +4,7 @@ pip install fastapi uvicorn httpx tqdm
 """
 import argparse
 import asyncio
+import os
 import sqlite3
 import ipaddress
 import json
@@ -17,7 +18,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from tqdm.asyncio import tqdm_asyncio 
 
 # Default Configuration
-SUBNETS = ["192.168.1.0/24"]
+CONFIG_FILE = "config.json"
 DB_FILE = "ollama_cluster.db"
 SCAN_INTERVAL = 300  
 CONCURRENCY_LIMIT = 1000
@@ -77,20 +78,38 @@ async def check_port(ip: str, port: int = 11434, timeout: float = 1.0) -> bool:
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
         return False
 
+def get_target_subnets():
+    """Reads the latest subnets from the JSON configuration file."""
+    if not os.path.exists(CONFIG_FILE):
+        log.warning(f"[-] Config file {CONFIG_FILE} not found. Skipping scan.")
+        return []
+        
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+            return config.get("subnets", [])
+    except json.JSONDecodeError:
+        log.error("[-] Invalid JSON in config file. Skipping scan.")
+        return []
+    
 async def execute_scan_cycle():
     """Performs the actual network sweep and database update."""
-    log.info(f"[*] Scanning subnets: {', '.join(SUBNETS)}...")
+    # Fetch the subnets dynamically at the start of every cycle
+    current_subnets = get_target_subnets()
+    
+    if not current_subnets:
+        log.info("[*] No subnets configured or valid in config.json. Waiting for next cycle.")
+        return
+
+    log.info(f"[*] Scanning subnets: {', '.join(current_subnets)}...")
     
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
     async def bounded_check(ip):
         async with sem:
-            # Introduce a micro-delay to throttle overall velocity 
-            # and evade basic rate-limiting detection.
-            await asyncio.sleep(0.01)
             return await check_port(ip)
             
     all_hosts = []
-    for subnet in SUBNETS:
+    for subnet in current_subnets:
         network = ipaddress.ip_network(subnet, strict=False)
         all_hosts.extend(list(network.hosts()))
         
@@ -219,12 +238,6 @@ async def proxy_ollama(path: str, request: Request):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ollama Cluster Router & Discovery Daemon")
     parser.add_argument(
-        "--subnets", 
-        nargs="+", 
-        required=True, 
-        help="List of CIDR subnets to scan (e.g., 10.237.0.0/16 10.208.0.0/16)"
-    )
-    parser.add_argument(
         "--port", 
         type=int, 
         default=8000, 
@@ -233,23 +246,27 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-concurrent-pings", 
         type=int, 
-        default=500, 
-        help="Maximum number of simultaneous network sockets to open. Lower this to avoid triggering security alerts (default: 500)"
+        default=50, 
+        help="Maximum number of simultaneous network sockets to open."
     )
     parser.add_argument(
         "--no-scan", 
         action="store_true", 
         help="Run the router only, relying on the existing database without background scanning."
     )
-    # --------------------
+    parser.add_argument(
+        "--config", 
+        type=str, 
+        default="config.json", 
+        help="Path to the JSON configuration file containing target subnets (default: config.json)"
+    )
     
     args = parser.parse_args()
     
-    SUBNETS.clear()
-    SUBNETS.extend(args.subnets)
-    
     # --- OVERRIDE THE GLOBAL CONFIG ---
     CONCURRENCY_LIMIT = args.max_concurrent_pings
+    DISABLE_SCAN = args.no_scan  
+    CONFIG_FILE = args.config
     
-    log.info(f"[*] Starting router on port {args.port} with max concurrency of {CONCURRENCY_LIMIT}...")
+    log.info(f"[*] Starting router on port {args.port} using config '{CONFIG_FILE}' with max concurrency {CONCURRENCY_LIMIT}...")
     uvicorn.run(app, host="0.0.0.0", port=args.port)
