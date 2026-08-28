@@ -104,4 +104,4 @@ To generate a snapshot of your current network topology and available models, ru
 ```bash
 python export_to_excel.py
 ```
-This will read the `ollama_cluster.db` SQLite database and generate a styled `.xlsx` file.
+This will read the `ollama_cluster.db` SQLite database and generate a styled `.xlsx` 

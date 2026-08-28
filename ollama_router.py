@@ -234,6 +234,46 @@ async def proxy_ollama(path: str, request: Request):
 
     return StreamingResponse(stream_proxy())
 
+@app.get("/api/tags")
+async def get_cluster_tags():
+    """
+    Returns the distinct union of all models available across the cluster,
+    formatted to match Ollama's native /api/tags response structure.
+    """
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            # Fetch distinct model names available across all active nodes
+            c.execute("SELECT DISTINCT model_name FROM models ORDER BY model_name ASC")
+            rows = c.fetchall()
+            
+        models_list = []
+        current_time = datetime.now(timezone.utc).isoformat()
+        
+        for (model_name,) in rows:
+            # Infer the base model family from the tag (e.g. 'qwen3-coder:30b' -> 'qwen3-coder')
+            base_family = model_name.split(":")[0] if ":" in model_name else model_name
+            
+            models_list.append({
+                "name": model_name,
+                "model": model_name,
+                "modified_at": current_time,
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": base_family,
+                    "families": [base_family],
+                    "parameter_size": "",
+                    "quantization_level": ""
+                }
+            })
+            
+        return JSONResponse(content={"models": models_list})
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch cluster models: {str(e)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ollama Cluster Router & Discovery Daemon")
