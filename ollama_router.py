@@ -200,18 +200,13 @@ async def get_status():
         rows = c.fetchall()
         return {"active_nodes": [{"ip": row[0], "models": row[1].split(",")} for row in rows]}
 
-@app.post("/{path:path}")
-async def proxy_ollama(path: str, request: Request):
-    body = await request.body()
-    try:
-        payload = json.loads(body)
-        model_req = payload.get("model")
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-    
+# --- DYNAMIC SDK ROUTING ---
+
+def get_node_for_model(model_req: str) -> str:
+    """Queries the SQLite database for a random active node hosting the requested model."""
     if not model_req:
         raise HTTPException(status_code=400, detail="Missing 'model' parameter in payload")
-    
+        
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("SELECT node_ip FROM models WHERE model_name = ? ORDER BY RANDOM() LIMIT 1", (model_req,))
@@ -221,18 +216,7 @@ async def proxy_ollama(path: str, request: Request):
         log.warning(f"[-] Blocked request: Model '{model_req}' not found on cluster.")
         raise HTTPException(status_code=404, detail=f"Model '{model_req}' not found")
         
-    target_url = f"http://{row[0]}:11434/{path}"
-    log.info(f"[~] Routing request for '{model_req}' -> {row[0]}")
-    
-    async def stream_proxy():
-        async with httpx.AsyncClient() as client:
-            proxy_headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
-            req = client.build_request(method=request.method, url=target_url, content=body, headers=proxy_headers)
-            async with client.stream(req.method, req.url, content=req.content, headers=req.headers) as resp:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
-
-    return StreamingResponse(stream_proxy())
+    return row[0]
 
 @app.get("/api/tags")
 async def get_cluster_tags():
@@ -274,6 +258,67 @@ async def get_cluster_tags():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch cluster models: {str(e)}")
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD"])
+async def proxy_catch_all(path: str, request: Request):
+    """
+    Transparently proxies raw bytes to the cluster.
+    If a model is requested, it dynamically routes to a node holding that model.
+    If no model is requested (e.g., /api/version), it routes to a random active node.
+    """
+    body = await request.body()
+    model_req = None
+    
+    # Attempt to extract a model name if it's a POST request
+    if request.method in ["POST", "PUT"] and body:
+        try:
+            payload = json.loads(body)
+            model_req = payload.get("model") or payload.get("name")
+        except json.JSONDecodeError:
+            pass 
+
+    # 1. Dynamic Routing (Model Specific)
+    if model_req:
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT node_ip FROM models WHERE model_name = ? ORDER BY RANDOM() LIMIT 1", (model_req,))
+            row = c.fetchone()
+            
+        if not row:
+            log.warning(f"[-] Blocked request: Model '{model_req}' not found on cluster.")
+            raise HTTPException(status_code=404, detail=f"Model '{model_req}' not found")
+        node_ip = row[0]
+        
+    # 2. Generic Fallback Routing (No Model Specified)
+    else:
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT DISTINCT ip FROM nodes ORDER BY RANDOM() LIMIT 1")
+            row = c.fetchone()
+            
+        if not row:
+            raise HTTPException(status_code=503, detail="No active nodes available in cluster")
+        node_ip = row[0]
+
+    target_url = f"http://{node_ip}:11434/{path}"
+    log.info(f"[~] Routing {request.method} /{path} -> {node_ip}")
+    
+    # 3. Transparent Byte Streaming
+    async def stream_proxy():
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            proxy_headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+            req = client.build_request(
+                method=request.method, 
+                url=target_url, 
+                content=body, 
+                headers=proxy_headers
+            )
+            async with client.stream(req.method, req.url, content=req.content, headers=req.headers) as resp:
+                # Pass the exact status code and headers back from the node
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+
+    return StreamingResponse(stream_proxy())
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ollama Cluster Router & Discovery Daemon")
