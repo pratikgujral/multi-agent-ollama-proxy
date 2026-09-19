@@ -263,8 +263,7 @@ async def get_cluster_tags():
 async def proxy_catch_all(path: str, request: Request):
     """
     Transparently proxies raw bytes to the cluster.
-    If a model is requested, it dynamically routes to a node holding that model.
-    If no model is requested (e.g., /api/version), it routes to a random active node.
+    Passes original status codes and headers to prevent client stream crashes.
     """
     body = await request.body()
     model_req = None
@@ -303,22 +302,42 @@ async def proxy_catch_all(path: str, request: Request):
     target_url = f"http://{node_ip}:11434/{path}"
     log.info(f"[~] Routing {request.method} /{path} -> {node_ip}")
     
-    # 3. Transparent Byte Streaming
-    async def stream_proxy():
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            proxy_headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
-            req = client.build_request(
-                method=request.method, 
-                url=target_url, 
-                content=body, 
-                headers=proxy_headers
-            )
-            async with client.stream(req.method, req.url, content=req.content, headers=req.headers) as resp:
-                # Pass the exact status code and headers back from the node
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
+    # 3. Establish connection and grab original headers
+    proxy_headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+    client = httpx.AsyncClient(timeout=120.0)
+    
+    req = client.build_request(
+        method=request.method, 
+        url=target_url, 
+        content=body, 
+        headers=proxy_headers
+    )
+    
+    try:
+        # We use stream=True to hold the connection open
+        resp = await client.send(req, stream=True)
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Target node unreachable: {str(e)}")
 
-    return StreamingResponse(stream_proxy())
+    # Filter out hop-by-hop headers that FastAPI will automatically handle
+    excluded_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded_headers}
+
+    # 4. Stream generator with strict cleanup
+    async def stream_generator():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_generator(),
+        status_code=resp.status_code,
+        headers=resp_headers
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ollama Cluster Router & Discovery Daemon")
