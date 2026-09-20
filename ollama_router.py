@@ -303,7 +303,20 @@ async def proxy_catch_all(path: str, request: Request):
     log.info(f"[~] Routing {request.method} /{path} -> {node_ip}")
     
     # 3. Establish connection and grab original headers
-    proxy_headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+    request_connection_tokens = {
+        token.strip().lower()
+        for token in request.headers.get("connection", "").split(",")
+        if token.strip()
+    }
+    excluded_request_headers = {
+        "host", "content-length", "connection", "keep-alive",
+        "proxy-authenticate", "proxy-authorization", "te", "trailer",
+        "transfer-encoding", "upgrade", *request_connection_tokens,
+    }
+    proxy_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in excluded_request_headers
+    }
     client = httpx.AsyncClient(timeout=120.0)
     
     req = client.build_request(
