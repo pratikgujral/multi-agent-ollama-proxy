@@ -329,6 +329,9 @@ async def proxy_catch_all(path: str, request: Request):
     try:
         # We use stream=True to hold the connection open
         resp = await client.send(req, stream=True)
+    except asyncio.CancelledError:
+        await client.aclose()
+        raise
     except Exception as e:
         await client.aclose()
         raise HTTPException(status_code=502, detail=f"Target node unreachable: {str(e)}")
