@@ -338,8 +338,6 @@ async def proxy_catch_all(path: str, request: Request):
 
     # Filter out hop-by-hop headers that FastAPI will automatically handle
     excluded_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
-    resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded_headers}
-
     # 4. Stream generator with strict cleanup
     async def stream_generator():
         try:
@@ -349,11 +347,16 @@ async def proxy_catch_all(path: str, request: Request):
             await resp.aclose()
             await client.aclose()
 
-    return StreamingResponse(
+    response = StreamingResponse(
         stream_generator(),
-        status_code=resp.status_code,
-        headers=resp_headers
+        status_code=resp.status_code
     )
+    response.raw_headers = [
+        (name, value)
+        for name, value in resp.headers.raw
+        if name.lower() not in excluded_headers
+    ]
+    return response
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ollama Cluster Router & Discovery Daemon")
