@@ -2,20 +2,23 @@
 Prerequisites:
 pip install fastapi uvicorn httpx tqdm
 """
+# Standard Library Imports
 import argparse
 import asyncio
-import os
-import sqlite3
 import ipaddress
 import json
-import uvicorn
 import logging
-from logging.handlers import RotatingFileHandler
+import os
+import sqlite3
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
+
+# Third-Party Imports
 import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-from tqdm.asyncio import tqdm_asyncio 
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from tqdm.asyncio import tqdm_asyncio
 
 # Default Configuration
 CONFIG_FILE = "config.json"
@@ -77,6 +80,31 @@ async def check_port(ip: str, port: int = 11434, timeout: float = 1.0) -> bool:
         return True
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
         return False
+
+# Helper to query real-time node state
+async def fetch_current_cluster_state():
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT ip FROM nodes")
+        nodes = [row[0] for row in c.fetchall()]
+
+    if not nodes:
+        return {"active_nodes": []}
+
+    async def verify_node(ip: str):
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            try:
+                resp = await client.get(f"http://{ip}:11434/api/tags")
+                if resp.status_code == 200:
+                    models = [m.get("name") for m in resp.json().get("models", [])]
+                    return {"ip": ip, "models": sorted(models), "status": "online"}
+            except Exception:
+                pass
+        return {"ip": ip, "status": "offline"}
+
+    results = await asyncio.gather(*(verify_node(ip) for ip in nodes))
+    active_nodes = [{"ip": r["ip"], "models": r["models"]} for r in results if r["status"] == "online"]
+    return {"active_nodes": active_nodes}
 
 def get_target_subnets():
     """Reads the latest subnets from the JSON configuration file."""
@@ -200,6 +228,94 @@ async def get_status():
         rows = c.fetchall()
         return {"active_nodes": [{"ip": row[0], "models": row[1].split(",")} for row in rows]}
 
+@app.get("/cluster/status/stream")
+async def stream_cluster_status(request: Request):
+    """
+    Server-Sent Events (SSE) endpoint that streams the real-time cluster state
+    every 3 seconds to connected browser clients.
+    """
+    async def event_generator():
+        while True:
+            # Detect if client disconnected (tab closed / navigation) to stop polling
+            if await request.is_disconnected():
+                break
+
+            status_data = await fetch_current_cluster_state()
+            
+            # SSE protocol format: 'data: <payload>\n\n'
+            yield f"data: {json.dumps(status_data)}\n\n"
+            
+            await asyncio.sleep(3)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Prevents Nginx/proxy buffering if deployed behind reverse proxy
+        }
+    )
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def get_dashboard():
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Ollama Cluster Live Monitor</title>
+        <style>
+            body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; }
+            h1 { font-size: 1.5rem; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+            .pulse { width: 10px; height: 10px; background: #22c55e; border-radius: 50%; box-shadow: 0 0 8px #22c55e; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1.25rem; margin-top: 1.5rem; }
+            .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 1.25rem; }
+            .ip { font-size: 1.1rem; font-weight: 600; color: #38bdf8; margin-bottom: 0.5rem; }
+            .model-tag { display: inline-block; background: #334155; color: #e2e8f0; font-size: 0.8rem; padding: 0.25rem 0.5rem; border-radius: 4px; margin: 0.2rem; }
+            #node-count { color: #94a3b8; font-size: 0.95rem; }
+        </style>
+    </head>
+    <body>
+        <h1><div class="pulse"></div> Ollama Cluster Live Monitor</h1>
+        <div id="node-count">Connecting to cluster stream...</div>
+        <div class="grid" id="cluster-grid"></div>
+
+        <script>
+            const eventSource = new EventSource('/cluster/status/stream');
+            const grid = document.getElementById('cluster-grid');
+            const nodeCount = document.getElementById('node-count');
+
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                const nodes = data.active_nodes || [];
+                
+                nodeCount.textContent = `Active Nodes: ${nodes.length} | Last Synced: ${new Date().toLocaleTimeString()}`;
+                
+                if (nodes.length === 0) {
+                    grid.innerHTML = '<div class="card" style="grid-column: 1/-1;">No active Ollama nodes detected.</div>';
+                    return;
+                }
+
+                grid.innerHTML = nodes.map(node => `
+                    <div class="card">
+                        <div class="ip">🖥️ ${node.ip}</div>
+                        <div><strong>Models (${node.models.length}):</strong></div>
+                        <div style="margin-top: 0.5rem;">
+                            ${node.models.map(m => `<span class="model-tag">${m}</span>`).join('')}
+                        </div>
+                    </div>
+                `).join('');
+            };
+
+            eventSource.onerror = (err) => {
+                nodeCount.textContent = 'Connection lost. Reconnecting...';
+            };
+        </script>
+    </body>
+    </html>
+    """
 # --- DYNAMIC SDK ROUTING ---
 
 def get_node_for_model(model_req: str) -> str:
