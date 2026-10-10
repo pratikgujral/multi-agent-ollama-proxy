@@ -303,7 +303,7 @@ async def get_dashboard():
                         <div class="ip">🖥️ ${node.ip}</div>
                         <div><strong>Models (${node.models.length}):</strong></div>
                         <div style="margin-top: 0.5rem;">
-                            ${node.models.map(m => `<span class="model-tag">${m}</span>`).join('')}
+                            ${node.models.map(m => `<span class="model-tag">${String(m).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}</span>`).join('')}
                         </div>
                     </div>
                 `).join('');
