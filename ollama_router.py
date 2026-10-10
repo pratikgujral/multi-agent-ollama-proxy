@@ -91,18 +91,20 @@ async def fetch_current_cluster_state():
     if not nodes:
         return {"active_nodes": []}
 
-    async def verify_node(ip: str):
-        async with httpx.AsyncClient(timeout=1.5) as client:
-            try:
-                resp = await client.get(f"http://{ip}:11434/api/tags")
-                if resp.status_code == 200:
-                    models = [m.get("name") for m in resp.json().get("models", [])]
-                    return {"ip": ip, "models": sorted(models), "status": "online"}
-            except Exception:
-                pass
-        return {"ip": ip, "status": "offline"}
+    sem = asyncio.Semaphore(min(20, len(nodes)))
+    async with httpx.AsyncClient(timeout=1.5) as client:
+        async def verify_node(ip: str):
+            async with sem:
+                try:
+                    resp = await client.get(f"http://{ip}:11434/api/tags")
+                    if resp.status_code == 200:
+                        models = [m.get("name") for m in resp.json().get("models", [])]
+                        return {"ip": ip, "models": sorted(models), "status": "online"}
+                except Exception:
+                    pass
+            return {"ip": ip, "status": "offline"}
 
-    results = await asyncio.gather(*(verify_node(ip) for ip in nodes))
+        results = await asyncio.gather(*(verify_node(ip) for ip in nodes))
     active_nodes = [{"ip": r["ip"], "models": r["models"]} for r in results if r["status"] == "online"]
     return {"active_nodes": active_nodes}
 
