@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -299,3 +300,16 @@ class TestRouting:
 
         assert error.value.status_code == status_code
         assert error.value.detail == detail
+
+
+class TestHealthEndpoint:
+    def test_health_returns_status(self, tmp_path):
+        database = tmp_path / "cluster.db"
+        create_database(database, nodes=["10.0.0.1"], models=[("10.0.0.1", "llama3")])
+        with patch.object(ollama_router, "DB_FILE", str(database)):
+            response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert data["active_nodes"] == 1
+        assert data["unique_models"] == 1
