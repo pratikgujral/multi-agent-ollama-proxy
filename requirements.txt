@@ -5,3 +5,4 @@ pandas
 ollama
 openpyxl
 tqdm
+pytest
