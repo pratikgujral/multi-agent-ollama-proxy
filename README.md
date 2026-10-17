@@ -1,73 +1,125 @@
-# Ollama Cluster Router & Discovery Daemon
+# 🦙 Ollama Cluster Router & Discovery Daemon
 
-A smart, self-healing reverse proxy that turns a network of individual Ollama machines into one massive, unified AI cluster.
+A smart, self-healing reverse proxy that automatically connects multiple Ollama instances across your network into one unified AI cluster.
 
-Instead of hardcoding different IP addresses for different models across your team or applications, you point everything to a single endpoint (`localhost:8000`). This router automatically scans your network to find active Ollama nodes, remembers which models live where, and seamlessly routes your requests to the right machine.
-
-If a machine goes offline, the router automatically drops it. If a new model is downloaded, the router instantly discovers it.
-
-## Architecture & Visuals
-
-### 1. Concurrent Subnet Discovery
-The daemon aggressively but safely sweeps entire corporate networks (multiple `/16` or `/24` subnets) to find active Ollama nodes without exhausting OS socket limits or triggering Intrusion Detection Systems (IDS).
-
-
-### 2. Smart Routing & Load Balancing
-The router intercepts your request, reads the requested model, and checks its internal database:
-* **Exclusive Routing:** If a model is only on one node, the request goes straight there.
-* **Load Balancing:** If multiple nodes have the same model (e.g., `qwen3-coder:30b`), requests are load-balanced randomly across them.
-* **Transparent Fallback:** Unrecognized or model-agnostic requests (like `GET /api/version`) are safely routed to a random healthy node.
-* **Missing Models:** If a model isn't anywhere on the network, it instantly returns a `404 Not Found`.
-
-
-### 3. Self-Healing Garbage Collection
-Nodes that drop offline or stop serving models are automatically pruned from the SQLite registry during the background scan cycle, preventing black-hole routing.
+Instead of remembering which machine has `llama3` or `qwen3-coder:30b`, you point your applications (Open WebUI, Continue.dev, LangChain, etc.) to **`http://localhost:8000`**. The router scans your network, catalogs models, and routes every prompt to an available machine hosting that model.
 
 ---
 
-## Prerequisites
+## 🚀 Quickstart (Beginner-Friendly)
 
-* Python 3.8+
-* An active internal network with machines running Ollama on port `11434`.
+### 1. Clone & Install Dependencies
 
-## Installation & Setup
+```bash
+git clone https://github.com/pratikgujral/multi-agent-ollama-proxy.git
+cd multi-agent-ollama-proxy
+pip install -r requirements.txt
+```
 
-1. Clone or download this repository.
-2. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Create a `config.json` file in the root directory to define the IP subnets you want the router to scan:
-   ```json
-   {
-     "subnets": [
-       "10.237.0.0/16",
-       "10.208.0.0/16"
-     ]
-   }
-   ```
-4. Start the router daemon:
-   ```bash
-   python ollama_router.py
-   ```
+### 2. Configure Your Network Subnets
 
-**Optional Startup Arguments:**
-* `--port`: The port to host the API router on (default: `8000`).
-* `--max-concurrent-pings`: Throttles the scanner to prevent IDS alerts (default: `50`).
-* `--no-scan`: Disables background scanning. The router will rely entirely on the existing SQLite database.
-* `--config`: Path to a custom JSON configuration file (default: `config.json`).
+Create or edit `config.json` in the project root:
+
+```json
+{
+  "subnets": [
+    "10.237.0.0/16",
+    "192.168.1.0/24"
+  ]
+}
+```
+*(Specify the subnets where your Ollama nodes live. Invalid subnets are automatically validated and skipped).*
+
+### 3. Start the Router
+
+```bash
+python ollama_router.py
+```
+
+Open **`http://localhost:8000/dashboard`** in your browser to watch active nodes and models appear in real time!
+
+---
+
+## 🧭 How It Works
+
+```
+                                      ┌───> [Node 10.237.1.10] (llama3:8b)
+[Your App / Open WebUI]               │
+         │                            ├───> [Node 10.237.1.11] (qwen3-coder:30b)
+         ▼                            │
+  http://localhost:8000 ──────────────┼───> [Node 10.237.1.12] (qwen3-coder:30b)
+  (Ollama Router Daemon)               │     (load-balanced randomly)
+                                      └───> [Node 10.237.1.13] (fallback node)
+```
+
+1. **Subnet Auto-Discovery**: Concurrently scans target IP ranges on port `11434` and queries each active node's `/api/tags` endpoint in parallel.
+2. **Dynamic Model Routing**:
+   - **Model-Specific**: Requests specifying a `model` (e.g. `/api/generate`, `/api/chat`) route directly to a node hosting that model. If multiple nodes host it, traffic is load-balanced across them.
+   - **Cluster-Wide Tags**: `GET /api/tags` returns the deduplicated union of all models available on the entire cluster.
+   - **Transparent Fallback**: Generic requests (like `/api/version`) route to any healthy node.
+   - **Missing Model**: Returns a prompt `404 Not Found` if no machine has the requested model.
+3. **High Performance**: Uses a persistent, shared connection pool (`httpx.AsyncClient`) for high throughput streaming inference without TCP handshake overhead.
+4. **Self-Healing Registry**: Machines that turn off or disconnect are automatically pruned on each cycle.
+
+---
+
+## 🛠️ API & Web Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/dashboard` | `GET` | Live browser dashboard monitoring online nodes & hosted models |
+| `/health` | `GET` | Service health, uptime, active node count, and model count |
+| `/cluster/status` | `GET` | JSON snapshot of all active nodes and their models |
+| `/cluster/status/stream` | `GET` | Real-time Server-Sent Events (SSE) stream for live updates |
+| `/cluster/scan` | `POST` | Trigger an immediate manual network scan cycle |
+| `/api/tags` | `GET` | Aggregated list of all models across all cluster nodes |
+| `/*` (All Ollama routes) | `ANY` | Transparent proxy to backend nodes (`/api/generate`, `/api/chat`, etc.) |
+
+---
+
+## ⚙️ Configuration & Options
+
+You can configure the router using CLI flags or environment variables:
+
+| Setting | CLI Flag | Environment Variable | Default | Description |
+|---|---|---|---|---|
+| Port | `--port` | `PORT` | `8000` | Port for the router to listen on |
+| Concurrency | `--max-concurrent-pings` | `CONCURRENCY_LIMIT` | `50` | Maximum simultaneous scan sockets |
+| Config File | `--config` | `CONFIG_FILE` | `config.json` | Path to subnets JSON file |
+| Scan Interval | — | `SCAN_INTERVAL` | `300` | Seconds between discovery sweeps |
+| Database Path | — | `DB_FILE` | `ollama_cluster.db` | Path to SQLite registry |
+| Disable Scanner | `--no-scan` | `DISABLE_SCAN=true` | `false` | Router-only mode without scanning |
+
+**Example using CLI flags:**
+```bash
+python ollama_router.py --port 9000 --max-concurrent-pings 100
+```
+
+**Example using Environment Variables (Docker / Uvicorn friendly):**
+```bash
+PORT=8000 SCAN_INTERVAL=180 python ollama_router.py
+```
 
 ---
 
 ## 🔌 Connecting Client Applications
 
-Because the router uses transparent byte-streaming, it behaves exactly like a native Ollama endpoint. You can plug it into any AI tool.
+Because the router streams raw HTTP bytes transparently, any client that talks to Ollama can use it seamlessly.
 
-### 1. Continue.dev (VS Code / JetBrains)
-To use the cluster for coding assistance, point Continue to the router port in your `config.yaml` file. 
+### 1. Open WebUI
 
-* **Mac/Linux:** `~/.continue/config.yaml`
-* **Windows:** `%USERPROFILE%\.continue\config.yaml`
+Set `OLLAMA_BASE_URL` to point to the router:
+
+```bash
+docker run -d -p 3000:8080 \
+  -e OLLAMA_BASE_URL=http://host.docker.internal:8000 \
+  --name open-webui \
+  ghcr.io/open-webui/open-webui:main
+```
+
+### 2. Continue.dev (VS Code / JetBrains)
+
+Point your Continue `config.yaml` to the router's port:
 
 ```yaml
 models:
@@ -78,61 +130,37 @@ models:
     roles:
       - chat
       - edit
-  
-  - name: "Cluster: Autocomplete"
-    provider: "ollama"
-    model: "qwen2.5-coder:1.5b-base"
-    apiBase: "http://localhost:8000"
-    roles:
-      - autocomplete
-```
-
-### 2. Open WebUI
-To use the cluster as the backend for Open WebUI, simply set the `OLLAMA_BASE_URL` environment variable when launching the WebUI docker container.
-
-```bash
-docker run -d -p 3000:8080 \
-  -e OLLAMA_BASE_URL=http://localhost:8000 \
-  -v open-webui:/app/backend/data \
-  --name open-webui \
-  ghcr.io/open-webui/open-webui:main
 ```
 
 ### 3. Python SDKs (LangChain, OpenAI, LiteLLM)
-You can point standard SDKs directly to the router. It supports both native Ollama endpoints and Ollama's OpenAI-compatibility layer (`/v1`).
 
 ```python
 from langchain_community.chat_models import ChatOllama
 
-# Point directly to the router's port
+# Point directly to the router
 llm = ChatOllama(
-    base_url="http://localhost:8000", 
+    base_url="http://localhost:8000",
     model="llama3.1:8b"
 )
-```
-
----
-
-## 🛠️ API Endpoints
-
-The router supports all standard Ollama endpoints (`/api/generate`, `/api/chat`, `/api/embed`, `/v1/messages`), plus custom management endpoints:
-
-* **`GET /api/tags`**: Dynamically aggregates and returns a deduplicated union of every model available across your entire cluster.
-* **`GET /cluster/status`**: Returns a JSON map of all currently active nodes and the specific models they are hosting.
-* **`POST /cluster/scan`**: Forces an immediate asynchronous network sweep (bypassing the 5-minute background timer).
-
-```bash
-# Force an instant network scan
-curl -X POST http://localhost:8000/cluster/scan
+print(llm.invoke("Explain quantum computing in one sentence."))
 ```
 
 ---
 
 ## 📊 Exporting Cluster Reports
 
-To generate a snapshot of your current network topology and available models for auditing or infrastructure monitoring, run the standalone export script:
+Generate a styled Excel spreadsheet report (`.xlsx`) documenting all nodes, last-seen timestamps, and hosted models:
 
 ```bash
 python export_to_excel.py
 ```
-This script reads the `ollama_cluster.db` SQLite database and generates a professionally styled `.xlsx` file detailing cluster capacity, model distribution, and active IP addresses.
+
+---
+
+## 🧪 Running Tests
+
+The test suite covers endpoints, proxying, concurrent state fetching, configuration handling, and health checks:
+
+```bash
+python -m pytest tests/ -v
+```
