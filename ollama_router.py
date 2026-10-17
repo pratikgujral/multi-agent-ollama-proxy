@@ -23,11 +23,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from tqdm.asyncio import tqdm_asyncio
 
 # Default Configuration
-CONFIG_FILE = "config.json"
-DB_FILE = "ollama_cluster.db"
-SCAN_INTERVAL = 300  
-CONCURRENCY_LIMIT = 1000
-DISABLE_SCAN = False
+CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
+DB_FILE = os.getenv("DB_FILE", "ollama_cluster.db")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
+CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "50"))
+DISABLE_SCAN = os.getenv("DISABLE_SCAN", "").lower() in ("1", "true", "yes")
 
 # Uptime tracking
 _start_time: float = 0.0
@@ -296,8 +296,13 @@ async def stream_cluster_status(request: Request):
         }
     )
 
+DASHBOARD_TEMPLATE = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def get_dashboard():
+    if os.path.exists(DASHBOARD_TEMPLATE):
+        with open(DASHBOARD_TEMPLATE, "r", encoding="utf-8") as f:
+            return f.read()
     return """
     <!DOCTYPE html>
     <html lang="en">
@@ -534,7 +539,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--port", 
         type=int, 
-        default=8000, 
+        default=int(os.getenv("PORT", "8000")), 
         help="Port to run the API router on (default: 8000)"
     )
     parser.add_argument(
