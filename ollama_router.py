@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -27,6 +28,9 @@ DB_FILE = "ollama_cluster.db"
 SCAN_INTERVAL = 300  
 CONCURRENCY_LIMIT = 1000
 DISABLE_SCAN = False
+
+# Uptime tracking
+_start_time: float = 0.0
 
 # Global event for manual scan triggering
 trigger_scan_event = asyncio.Event()
@@ -203,6 +207,8 @@ async def scan_network_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _start_time
+    _start_time = time.monotonic()
     init_db()
     if not DISABLE_SCAN:
         task = asyncio.create_task(scan_network_loop())
@@ -377,6 +383,25 @@ async def get_cluster_tags():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch cluster models: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM nodes")
+        node_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT model_name) FROM models")
+        model_count = c.fetchone()[0]
+
+    uptime = time.monotonic() - _start_time
+    return {
+        "status": "healthy",
+        "uptime_seconds": round(uptime, 1),
+        "active_nodes": node_count,
+        "unique_models": model_count,
+        "scan_enabled": not DISABLE_SCAN,
+        "scan_interval_seconds": SCAN_INTERVAL
+    }
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD"])
 async def proxy_catch_all(path: str, request: Request):
