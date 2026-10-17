@@ -61,7 +61,7 @@ def export_database():
                     try:
                         if len(str(cell.value)) > max_length:
                             max_length = len(str(cell.value))
-                    except:
+                    except Exception:
                         pass
                 adjusted_width = (max_length + 4)
                 ws.column_dimensions[column].width = adjusted_width

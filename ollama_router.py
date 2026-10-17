@@ -118,10 +118,19 @@ def get_target_subnets():
     try:
         with open(CONFIG_FILE, "r") as f:
             config = json.load(f)
-            return config.get("subnets", [])
+            raw_subnets = config.get("subnets", [])
     except json.JSONDecodeError:
         log.error("[-] Invalid JSON in config file. Skipping scan.")
         return []
+    
+    validated = []
+    for subnet in raw_subnets:
+        try:
+            ipaddress.ip_network(subnet, strict=False)
+            validated.append(subnet)
+        except ValueError:
+            log.warning(f"[-] Skipping invalid subnet entry: '{subnet}'")
+    return validated
     
 async def execute_scan_cycle():
     """Performs the actual network sweep and database update."""
@@ -159,34 +168,44 @@ async def execute_scan_cycle():
     if active_ips:
         log.info(f"[*] Found {len(active_ips)} active endpoints. Fetching model tags...")
     
+    tag_sem = asyncio.Semaphore(min(20, max(len(active_ips), 1)))
+
+    async def fetch_tags(client: httpx.AsyncClient, ip: str):
+        async with tag_sem:
+            try:
+                resp = await client.get(f"http://{ip}:11434/api/tags")
+                if resp.status_code == 200:
+                    models = resp.json().get("models", [])
+                    return ip, models
+            except httpx.RequestError:
+                pass
+        return ip, None
+
     async with httpx.AsyncClient(timeout=5.0) as client:
-        with sqlite3.connect(DB_FILE) as conn:
-            c = conn.cursor()
-            for ip in active_ips:
-                try:
-                    resp = await client.get(f"http://{ip}:11434/api/tags")
-                    if resp.status_code == 200:
-                        models = resp.json().get("models", [])
-                        c.execute("INSERT OR REPLACE INTO nodes (ip, last_seen) VALUES (?, datetime('now'))", (ip,))
-                        c.execute("DELETE FROM models WHERE node_ip = ?", (ip,))
-                        for m in models:
-                            c.execute("INSERT INTO models (node_ip, model_name) VALUES (?, ?)", (ip, m["name"]))
-                        
-                        valid_nodes.append(ip)
-                        log.info(f"[+] Node {ip} registered with {len(models)} models.")
-                except httpx.RequestError:
-                    pass
-            
-            if valid_nodes:
-                placeholders = ','.join('?' for _ in valid_nodes)
-                c.execute(f"DELETE FROM nodes WHERE ip NOT IN ({placeholders})", valid_nodes)
-                c.execute(f"DELETE FROM models WHERE node_ip NOT IN ({placeholders})", valid_nodes)
-            else:
-                c.execute("DELETE FROM nodes")
-                c.execute("DELETE FROM models")
-                log.warning("[-] No valid models found during this cycle. Routing tables cleared.")
-            
-            conn.commit()
+        tag_results = await asyncio.gather(*(fetch_tags(client, ip) for ip in active_ips))
+
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        for ip, models in tag_results:
+            if models is not None:
+                c.execute("INSERT OR REPLACE INTO nodes (ip, last_seen) VALUES (?, datetime('now'))", (ip,))
+                c.execute("DELETE FROM models WHERE node_ip = ?", (ip,))
+                for m in models:
+                    c.execute("INSERT INTO models (node_ip, model_name) VALUES (?, ?)", (ip, m["name"]))
+                
+                valid_nodes.append(ip)
+                log.info(f"[+] Node {ip} registered with {len(models)} models.")
+        
+        if valid_nodes:
+            placeholders = ','.join('?' for _ in valid_nodes)
+            c.execute(f"DELETE FROM nodes WHERE ip NOT IN ({placeholders})", valid_nodes)
+            c.execute(f"DELETE FROM models WHERE node_ip NOT IN ({placeholders})", valid_nodes)
+        else:
+            c.execute("DELETE FROM nodes")
+            c.execute("DELETE FROM models")
+            log.warning("[-] No valid models found during this cycle. Routing tables cleared.")
+        
+        conn.commit()
 
 async def scan_network_loop():
     """Background loop that waits for interval OR a manual trigger."""
@@ -397,15 +416,7 @@ async def proxy_catch_all(path: str, request: Request):
 
     # 1. Dynamic Routing (Model Specific)
     if model_req:
-        with sqlite3.connect(DB_FILE) as conn:
-            c = conn.cursor()
-            c.execute("SELECT node_ip FROM models WHERE model_name = ? ORDER BY RANDOM() LIMIT 1", (model_req,))
-            row = c.fetchone()
-            
-        if not row:
-            log.warning(f"[-] Blocked request: Model '{model_req}' not found on cluster.")
-            raise HTTPException(status_code=404, detail=f"Model '{model_req}' not found")
-        node_ip = row[0]
+        node_ip = get_node_for_model(model_req)
         
     # 2. Generic Fallback Routing (No Model Specified)
     else:
