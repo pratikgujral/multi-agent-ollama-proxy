@@ -35,6 +35,9 @@ _start_time: float = 0.0
 # Global event for manual scan triggering
 trigger_scan_event = asyncio.Event()
 
+# Shared httpx client for proxying requests (initialized in lifespan)
+proxy_client: httpx.AsyncClient | None = None
+
 # --- LOGGING CONFIGURATION ---
 def setup_logger():
     # Create a custom logger
@@ -97,6 +100,8 @@ async def fetch_current_cluster_state():
         return {"active_nodes": []}
 
     sem = asyncio.Semaphore(min(20, len(nodes)))
+    # Short-lived client is fine here: this function is called infrequently
+    # (SSE polling every few seconds) and targets many nodes with a short timeout.
     async with httpx.AsyncClient(timeout=1.5) as client:
         async def verify_node(ip: str):
             async with sem:
@@ -226,9 +231,13 @@ async def scan_network_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _start_time
+    global _start_time, proxy_client
     _start_time = time.monotonic()
     init_db()
+    proxy_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=5.0),
+        limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+    )
     if not DISABLE_SCAN:
         task = asyncio.create_task(scan_network_loop())
         yield
@@ -236,6 +245,8 @@ async def lifespan(app: FastAPI):
     else:
         log.info("[*] Running in router-only mode. Background scanner is disabled.")
         yield
+    await proxy_client.aclose()
+    proxy_client = None
 
 app = FastAPI(lifespan=lifespan)
 
@@ -472,7 +483,8 @@ async def proxy_catch_all(path: str, request: Request):
         k: v for k, v in request.headers.items()
         if k.lower() not in excluded_request_headers
     }
-    client = httpx.AsyncClient(timeout=120.0)
+    
+    client = proxy_client if proxy_client is not None else httpx.AsyncClient(timeout=120.0)
     
     req = client.build_request(
         method=request.method, 
@@ -485,10 +497,12 @@ async def proxy_catch_all(path: str, request: Request):
         # We use stream=True to hold the connection open
         resp = await client.send(req, stream=True)
     except asyncio.CancelledError:
-        await client.aclose()
+        if proxy_client is None:
+            await client.aclose()
         raise
     except Exception as e:
-        await client.aclose()
+        if proxy_client is None:
+            await client.aclose()
         raise HTTPException(status_code=502, detail=f"Target node unreachable: {str(e)}")
 
     # Filter out hop-by-hop headers that FastAPI will automatically handle
@@ -499,8 +513,10 @@ async def proxy_catch_all(path: str, request: Request):
             async for chunk in resp.aiter_bytes():
                 yield chunk
         finally:
+            # Only close the response stream; the shared client stays open unless created as fallback
             await resp.aclose()
-            await client.aclose()
+            if proxy_client is None:
+                await client.aclose()
 
     response = StreamingResponse(
         stream_generator(),
