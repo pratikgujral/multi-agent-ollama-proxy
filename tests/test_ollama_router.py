@@ -299,3 +299,76 @@ class TestRouting:
 
         assert error.value.status_code == status_code
         assert error.value.detail == detail
+
+
+class TestProxyCatchAll:
+    def test_post_with_model_routes_to_correct_node(self, tmp_path):
+        database = tmp_path / "cluster.db"
+        create_database(database, nodes=["10.0.0.1"], models=[("10.0.0.1", "llama3")])
+
+        with patch.object(ollama_router, "DB_FILE", str(database)):
+            # Mock the httpx client used in proxy
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.headers = httpx.Headers({"content-type": "application/json"})
+
+            async def mock_aiter_bytes():
+                yield b'{"response": "hello"}'
+            mock_response.aiter_bytes = mock_aiter_bytes
+            mock_response.aclose = AsyncMock()
+
+            mock_client = MagicMock()
+            mock_client.build_request = MagicMock(return_value=MagicMock())
+            mock_client.send = AsyncMock(return_value=mock_response)
+            mock_client.aclose = AsyncMock()
+
+            with patch("ollama_router.httpx.AsyncClient", return_value=mock_client), \
+                 patch.object(ollama_router, "proxy_client", mock_client):
+                response = client.post(
+                    "/api/generate",
+                    json={"model": "llama3", "prompt": "hello"}
+                )
+
+            assert response.status_code == 200
+
+    def test_post_without_model_falls_back_to_random_node(self, tmp_path):
+        database = tmp_path / "cluster.db"
+        create_database(database, nodes=["10.0.0.1"], models=[("10.0.0.1", "llama3")])
+
+        with patch.object(ollama_router, "DB_FILE", str(database)):
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.headers = httpx.Headers({"content-type": "application/json"})
+            async def mock_aiter_bytes():
+                yield b'ok'
+            mock_response.aiter_bytes = mock_aiter_bytes
+            mock_response.aclose = AsyncMock()
+
+            mock_client = MagicMock()
+            mock_client.build_request = MagicMock(return_value=MagicMock())
+            mock_client.send = AsyncMock(return_value=mock_response)
+            mock_client.aclose = AsyncMock()
+
+            with patch("ollama_router.httpx.AsyncClient", return_value=mock_client), \
+                 patch.object(ollama_router, "proxy_client", mock_client):
+                response = client.get("/api/version")
+
+            assert response.status_code == 200
+
+    def test_no_nodes_returns_503(self, tmp_path):
+        database = tmp_path / "cluster.db"
+        create_database(database)
+
+        with patch.object(ollama_router, "DB_FILE", str(database)):
+            response = client.get("/api/version")
+
+        assert response.status_code == 503
+
+    def test_unknown_model_returns_404(self, tmp_path):
+        database = tmp_path / "cluster.db"
+        create_database(database, nodes=["10.0.0.1"], models=[("10.0.0.1", "llama3")])
+
+        with patch.object(ollama_router, "DB_FILE", str(database)):
+            response = client.post("/api/generate", json={"model": "nonexistent"})
+
+        assert response.status_code == 404
